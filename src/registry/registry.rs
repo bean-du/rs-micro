@@ -1,7 +1,5 @@
 use async_trait::async_trait;
 use etcd_client::PutOptions;
-use actix_rt;
-use Sized;
 use std::time::Duration;
 use super::*;
 
@@ -45,7 +43,7 @@ impl Etcd {
         let options = PutOptions::new().with_lease(lease_id);
         self.client.put(key.clone(), json, Some(options)).await?;
 
-        let (mut keeper, mut stream) = self.client.lease_keep_alive(lease_id).await?;
+        let (mut keeper, _) = self.client.lease_keep_alive(lease_id).await?;
         self.registered.insert(key, lease_id.to_string());
 
         tokio::spawn(async move {
