@@ -1,13 +1,12 @@
 use std::collections::HashMap;
-use std::fs::read;
 use std::io;
-use std::sync::mpsc::Receiver;
-use std::task::ready;
-use prost::bytes::BufMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{Interest};
 use tokio::net::TcpStream;
+use tokio::net::unix::SocketAddr;
 use crate::registry::IResult;
 use tokio::sync::mpsc;
+use crate::protocol::packet;
+use crate::protocol::packet::{ByteBuffer, Packet};
 
 pub struct TcpServer {
     pub addr: String,
@@ -17,16 +16,16 @@ pub struct TcpServer {
 
 pub struct Conn {
     pub id: String,
+    pub ip: SocketAddr,
     pub tx: mpsc::Sender<Vec<u8>>,
-    pub rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Conn {
-    pub fn new(id: String, tx: mpsc::Sender<Vec<u8>>, rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    pub fn new(id: String, ip: SocketAddr, tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
             id,
+            ip,
             tx,
-            rx,
         }
     }
 }
@@ -43,16 +42,18 @@ impl TcpServer {
         loop {
             let (socket, _) = listener.accept().await?;
 
-            self.handle_conn(socket);
+            match self.handle_conn(socket) {
+                Ok(_) => {}
+                Err(e) => {}
+            }
         }
     }
 
-    pub fn handle_conn(&self, socket: TcpStream) {
-        let (tx, mut rx): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel(100);
+    pub fn handle_conn(&self, socket: TcpStream) -> IResult<()> {
+        let (tx, mut rx): (mpsc::Sender<Packet>, mpsc::Receiver<Packet>) = mpsc::channel(100);
         let (reader, writer) = socket.into_split();
 
         tokio::spawn(async move {
-            let mut i = 1;
             loop {
                 let reade_ready = match reader.ready(Interest::READABLE).await {
                     Ok(r) => r,
@@ -61,23 +62,33 @@ impl TcpServer {
                         return;
                     }
                 };
-                println!("{}", i);
+
                 if reade_ready.is_readable() {
-                    let mut data = vec![0; 1024];
+                    let mut pkt = ByteBuffer::new();
                     // Try to read data, this may still fail with `WouldBlock`
                     // if the readiness event is a false positive.
-                    match reader.try_read(&mut data) {
+                    match reader.try_read(&mut pkt.buf) {
                         Ok(n) => {
-                            println!("read {} bytes", n);
-                            println!("data {:?} ", String::from_utf8(data.clone()));
-                            // 读取到数据后，这里调用具体的处理函数处理
-                            match tx.send(data.to_vec()).await {
-                                Ok(_) => { println!("send data to channel success") }
-                                Err(e) => { println!("send data to channel failed: {}", e) }
+                            let packets = match pkt.get_packet() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    println!("parse packet error: {}", e);
+                                    continue
+                                }
+                            };
+
+                            for packet in packets {
+                                // 读取到数据后，这里调用具体的处理函数处理
+                                println!("Data: {}\n", packet);
+                                match tx.send(packet).await {
+                                    Ok(_) => {}
+                                    Err(e) => { println!("send data to channel failed: {}", e) }
+                                }
                             }
+
+
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            println!("read data error {}", e);
                             continue;
                         }
                         Err(e) => {
@@ -86,34 +97,23 @@ impl TcpServer {
                         }
                     }
                 }
-                i +=1;
             }
         });
 
         tokio::spawn(async move {
-            let write_ready = match writer.ready(Interest::WRITABLE).await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("socket listen event error: {}", e);
-                    return;
-                }
-            };
-
-            loop {
-                let data = match rx.recv().await {
-                    Some(d) => d,
-                    None => { continue; }
+            while let Some(data) = rx.recv().await {
+                let write_ready = match writer.ready(Interest::WRITABLE).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!("socket listen event error: {}", e);
+                        return;
+                    }
                 };
-
-                println!("Received: {:?}", data);
-
                 if write_ready.is_writable() {
                     // Try to write data, this may still fail with `WouldBlock`
                     // if the readiness event is a false positive.
-                    match writer.try_write(&data) {
-                        Ok(n) => {
-                            println!("write {} bytes", n);
-                        }
+                    match writer.try_write(&data.to_string().as_bytes()) {
+                        Ok(n) => {}
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             println!("write data error {}", e);
                             continue;
@@ -126,6 +126,8 @@ impl TcpServer {
                 }
             }
         });
+
+        Ok(())
     }
 }
 
